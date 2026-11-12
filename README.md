@@ -10,12 +10,14 @@ The plugin is a standalone `gemini-decisions` plugin and does not replace new-ap
 
 This project targets the Task Plugin v1 interface in new-api **v1.0.0-rc.49**. The plugin interface is still evolving; older versions may not support custom native routes or `retainResult`.
 
-1. Sign in to new-api as an administrator, open **Task Plugins**, enable the task plugin system, then upload and enable `plugin.js` from the repository root. You can also use the [raw URL for plugin.js](https://raw.githubusercontent.com/huangdijia/new-api-plugin-gemini-decisions/main/plugin.js) in the upload dialog.
+1. Sign in to new-api as a **Root super administrator** (required to upload and enable Task Plugins), open **Task Plugins**, enable the task plugin system, then upload and enable `plugin.js` from the repository root. You can also use the [raw URL for plugin.js](https://raw.githubusercontent.com/huangdijia/new-api-plugin-gemini-decisions/main/plugin.js) in the upload dialog.
 2. Create a channel of type **Task Plugin** and select `gemini-decisions`:
-   - Base URL: `https://generativelanguage.googleapis.com` (the plugin uses this default when left blank).
+   - Base URL: `https://generativelanguage.googleapis.com` (the default when blank). For Google or an upstream new-api instance, use the service root URL or one ending in `/v1beta`; both forms accept a trailing slash.
    - Key: a Gemini API key from Google AI Studio.
    - Model: `gemini-decision-1`. Configure the groups allowed to use it.
 3. Configure the task usage billing expression below for the model, then make requests with a new-api token. Configure the Google API key only in the channel; clients use a new-api token.
+
+For an existing installation, upload and enable plugin **0.2.0**. new-api does not allow different source code to reuse the same plugin key/version. Existing billing expressions and the fixed 262,144-token reservation remain unchanged.
 
 If the upstream is another new-api instance **with this plugin installed**, you can use a channel of type New API, bind it to the upstream task plugin, and set the channel key to the upstream gateway token.
 
@@ -30,6 +32,8 @@ tier("base", u("input_tokens") * 0.1 / 1000000)
 Task Plugin expressions return a US dollar amount directly, so `/ 1000000` must not be omitted. If multiple plugins provide a model with the same name, you can configure a provider-specific expression for `gemini-decisions::gemini-decision-1`. Actual prices, group multipliers, and free allowances depend on your configuration and [Google's pricing](https://aistudio.google.com/docs/pricing#gemini-decision). Legacy per-request pricing continues to charge per request; it does not automatically switch to token-based billing.
 
 Because the gateway cannot reliably calculate token counts for all multimodal inputs before a request, the plugin reserves quota for the model's context limit of **262,144 input tokens**. After a successful request, it settles the charge using `usage.total_input_tokens`. If usage is missing, negative, non-integer, or above the limit, the reservation is retained and the host records a warning. With the expression above and a group multiplier of 1, the reservation is approximately USD 0.0262144. If the balance cannot cover the reservation, the request is not sent to Google.
+
+Google states that failed requests returning **400 or 500** are not charged for tokens, but still count toward quota. This is Google's upstream billing policy, distinct from the gateway's reservation and settlement behavior. See the [billing FAQ](https://aistudio.google.com/docs/billing#am-i-charged-for-failed-requests).
 
 ## REST Requests
 
@@ -81,10 +85,14 @@ print(result.answers["damaged"].noul, result.usage.total_input_tokens)
 
 ## Behavior and Limitations
 
-- Google's limits include 1–1,000 questions per request and a total context of 262,144 tokens. Refer to the [official documentation](https://aistudio.google.com/docs/decisions-api#limits) for question formats and media limits. The plugin performs only basic request checks; Google handles the remaining validation.
-- `input` can contain officially supported text, multimodal content blocks, public or signed HTTPS URLs, and existing Google Files URIs. This plugin implements only Decisions and does not provide Files API uploads. Request body size is also subject to the new-api host's limits.
-- Results are returned synchronously. The plugin sets `retainResult: false`: new-api does not persist `task.data` for the call, but still retains task records and billing logs. The exact log contents depend on the host configuration.
-- HTTP errors are processed by the new-api host. Raw upstream error details may be sanitized and are not guaranteed to pass through unchanged. The plugin does not log keys or request contents.
+- Google allows 1–1,000 questions per request and a total context of 262,144 tokens. Question keys must contain **1–64 ASCII characters** using only letters, digits, `_`, or `-`. Supported types are `noul`, `choice`, and `score`; `choice` and `score` each require **2–255 entries**, and each `score` entry must be a nonempty string. `instructions` is required and accepts a string, a TextContent object, or a nonempty array of TextContent objects. The plugin validates these requirements; Google validates the remaining format constraints. See the [official limits](https://aistudio.google.com/docs/decisions-api#limits).
+- `input` supports Google's text, multimodal content blocks, public or signed external HTTPS URLs, and existing Google Files URIs. Google's [input limits](https://aistudio.google.com/docs/decisions-api#input) allow up to **100 MB of inline data per request**, **50 MB for PDF**, and **15 MB per external HTTPS URL**. For larger files, upload directly to the Google Files API first and use the resulting URI. This plugin does not implement Files API uploads; an arbitrary external URL does not bypass the 15 MB limit.
+- In new-api **v1.0.0-rc.49**, `MAX_REQUEST_BODY_MB` defaults to **128 MiB** and limits the entire decompressed JSON request body. Base64 adds approximately one third to the raw file size, plus JSON overhead. For example, a **100 MiB** raw file exceeds 128 MiB after Base64 encoding, even before JSON overhead. Google's 100 MB inline limit and the host's 128 MiB body limit use different units and scopes; a 100 MB raw file does not necessarily exceed the host limit.
+- Results are synchronous. In new-api **v1.0.0-rc.49**, `RELAY_TIMEOUT` defaults to **0**, which sets no overall timeout on the outbound HTTP client. `RELAY_RESPONSE_HEADER_TIMEOUT` defaults to **1800 seconds** and limits the wait for response headers. Client or reverse-proxy timeouts may still apply.
+- For upstream **2xx** responses successfully read by the host and passed to the plugin, missing answer entries or mismatched answer types do not prevent usage settlement; the plugin preserves the upstream answers. If there is no `answers` object, it settles usage first and then returns **502**. Invalid usage retains the reservation as described above; a 502 alone does not imply a refund. Failures before the host passes the response to the plugin may still cause a refund.
+- When new-api gateways are chained, an upstream gateway may settle usage and then return 502 for a missing `answers` object. A downstream v1.0.0-rc.49 gateway refunds its caller on that non-2xx response, so the downstream operator may bear the upstream charge.
+- The plugin sets `retainResult: false`: new-api does not persist `task.data` for the call, but still retains task records and billing logs. The exact log contents depend on the host configuration.
+- HTTP errors are processed by the new-api host. Some upstream 4xx JSON error envelopes can be preserved, but byte-for-byte passthrough is not guaranteed, and 5xx details may be sanitized. The plugin does not log keys or request contents.
 
 ## Verification
 
@@ -102,6 +110,8 @@ tests/run-integration.sh /path/to/new-api-v1.0.0-rc.49
 ```
 
 After installing `google-genai` 3.2.0, you can also run `python tests/sdk_compat_test.py` to check the SDK's request path, Bearer header, and response parsing against a local mock service. This test is independent of the host integration tests.
+
+The [GitHub Actions workflow](.github/workflows/test.yml) runs these checks against a pinned new-api revision. These checks use fixtures or local mocks; they do not demonstrate a successful request to the live Google API.
 
 ## License
 

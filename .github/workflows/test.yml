@@ -1,0 +1,83 @@
+name: Plugin compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: new-api v1.0.0-rc.49
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+          persist-credentials: false
+      - name: Check out official host
+        uses: actions/checkout@v4
+        with:
+          repository: QuantumNous/new-api
+          # v1.0.0-rc.49; use an immutable revision instead of a moving tag.
+          ref: 48a6c87f9e7757fdc58e5be9bcb4f8281ad0dfd0
+          path: new-api
+          persist-credentials: false
+      - name: Set up host Go version
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: new-api/go.mod
+          cache-dependency-path: |
+            new-api/go.sum
+            new-api/relaykit/go.sum
+            new-api/tokenkit/go.sum
+      - name: Run real host plugin lint and fixture
+        working-directory: new-api
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli_dir="$(mktemp -d "$RUNNER_TEMP/gemini-decisions-cli.XXXXXXXX")"
+          trap 'rm -rf -- "$cli_dir"' EXIT
+          # Import the official CLI implementation without building the web UI.
+          cat > "$cli_dir/main.go" <<'GO'
+          package main
+
+          import (
+              "os"
+              "github.com/QuantumNous/new-api/pkg/jsplugin"
+          )
+
+          func main() {
+              os.Exit(jsplugin.RunCLI(os.Args[1:], os.Stdout, os.Stderr))
+          }
+          GO
+          go build -o "$cli_dir/plugin-cli" "$cli_dir/main.go"
+          "$cli_dir/plugin-cli" lint "$GITHUB_WORKSPACE/plugin/plugin.js"
+          "$cli_dir/plugin-cli" test "$GITHUB_WORKSPACE/plugin/plugin.js" \
+            --fixture "$GITHUB_WORKSPACE/plugin/fixtures/decisions.json"
+      - name: Run real host integration with local upstream mock
+        shell: bash
+        run: bash plugin/tests/run-integration.sh "$GITHUB_WORKSPACE/new-api"
+
+  sdk:
+    name: Google Python SDK 3.2.0 local contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install official SDK
+        run: python -m pip install google-genai==3.2.0
+      - name: Run local SDK compatibility test
+        run: python tests/sdk_compat_test.py

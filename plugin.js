@@ -10,7 +10,7 @@ export const meta = {
   apiVersion: 1,
   key: PLUGIN_KEY,
   name: "Gemini Decisions",
-  version: "0.1.0",
+  version: "0.2.0",
   icon: "Gemini.Color",
   author: { name: "huangdijia", url: "https://github.com/huangdijia" },
   website: "https://github.com/huangdijia/new-api-plugin-gemini-decisions",
@@ -47,6 +47,10 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isTextBlock(value) {
+  return isObject(value) && value.type === "text" && typeof value.text === "string";
+}
+
 function validateRequest(body) {
   if (!isObject(body)) throw new Error("Request body must be a JSON object");
   if (typeof body.model !== "string" || !body.model.trim()) throw new Error("model is required");
@@ -57,8 +61,34 @@ function validateRequest(body) {
     (Array.isArray(input) && input.length === 0)
   ) throw new Error("input must be nonempty text or content blocks");
   if (!isObject(body.questions)) throw new Error("questions must be an object");
-  const count = Object.keys(body.questions).length;
-  if (count < 1 || count > 1000) throw new Error("questions must contain 1 to 1000 entries");
+  const keys = Object.keys(body.questions);
+  if (keys.length < 1 || keys.length > 1000) throw new Error("questions must contain 1 to 1000 entries");
+  for (const key of keys) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(key))
+      throw new Error("question key must contain 1 to 64 ASCII letters, digits, underscores, or hyphens");
+    const question = body.questions[key];
+    if (!isObject(question) || !["noul", "choice", "score"].includes(question.type))
+      throw new Error("question type must be noul, choice, or score");
+    const instructions = question.instructions;
+    if (
+      typeof instructions !== "string" &&
+      !isTextBlock(instructions) &&
+      !(Array.isArray(instructions) && instructions.length > 0 && instructions.every(isTextBlock))
+    ) throw new Error("question instructions must be text or nonempty text content blocks");
+    if (question.type === "choice") {
+      if (!isObject(question.criteria)) throw new Error("choice criteria must contain 2 to 255 options");
+      const options = Object.keys(question.criteria);
+      if (options.length < 2 || options.length > 255 || options.some((option) => typeof question.criteria[option] !== "string"))
+        throw new Error("choice criteria must contain 2 to 255 string descriptions");
+    } else if (question.type === "score") {
+      if (
+        !Array.isArray(question.criteria) ||
+        question.criteria.length < 2 ||
+        question.criteria.length > 255 ||
+        question.criteria.some((level) => typeof level !== "string" || level.length === 0)
+      ) throw new Error("score criteria must contain 2 to 255 nonempty strings");
+    }
+  }
   return body;
 }
 
@@ -74,7 +104,8 @@ function decisionRequest(ctx) {
 
 export function buildSubmitRequest(ctx) {
   const body = decisionRequest(ctx);
-  const baseUrl = ctx.baseUrl.replace(/\/+$/, "");
+  // The channel may be configured with the service root or its v1beta URL.
+  const baseUrl = ctx.baseUrl.replace(/\/+$/, "").replace(/\/v1beta$/, "");
   const viaGateway = Boolean(ctx.upstream && ctx.upstream.kind === "new_api");
   const headers = { "Content-Type": "application/json", Accept: "application/json" };
   if (viaGateway) headers.Authorization = "Bearer " + ctx.apiKey;
@@ -88,19 +119,12 @@ export function buildSubmitRequest(ctx) {
 }
 
 export function parseSubmitResponse(ctx, response) {
-  if (response.statusCode < 200 || response.statusCode >= 300) throw new Error("Decision request failed");
-  const body = response.body;
-  if (!isObject(body) || !isObject(body.answers)) throw new Error("Decision response is missing answers");
-  const questions = ctx.requestBody.questions;
-  for (const key of Object.keys(questions)) {
-    const answer = Object.prototype.hasOwnProperty.call(body.answers, key) ? body.answers[key] : null;
-    if (!isObject(answer) || !isObject(questions[key]) || answer.type !== questions[key].type)
-      throw new Error("Decision response is missing a matching answer for a question");
-  }
   if (!ctx.publicTaskId) throw new Error("Missing gateway request ID");
+  // The host invokes this hook only for 2xx responses. Preserve the body so
+  // completion usage settles before the presenter checks the answer envelope.
   return {
     taskId: ctx.publicTaskId,
-    taskData: body,
+    taskData: response.body,
     immediate: { status: "SUCCESS", progress: "100%" },
   };
 }
@@ -138,15 +162,25 @@ export const native = {
     return { kind: "submit", model: body.model, action: "decisions", requestBody: body };
   },
   renderDecision: function (ctx, task) {
-    return task.data;
+    // Native presenters run after the host settles billing. Individual answers
+    // remain untouched, even if incomplete or a future type is returned.
+    if (!isObject(task.data) || !isObject(task.data.answers)) {
+      return { __status: 502, __body: { error: { code: 502, message: "Decision response is missing answers" } } };
+    }
+    // Wrapping also keeps an upstream __status field from being interpreted as
+    // a host reply wrapper instead of part of the Google response.
+    return { __status: 200, __body: task.data };
   },
   error: function (ctx, error) {
     // The host supplies a sanitized error, not the original HTTP response.
     // Some 4xx details are JSON; preserve their Google envelope when available.
     try {
       const detail = JSON.parse(error.message);
-      if (isObject(detail) && isObject(detail.error)) return detail;
+      if (isObject(detail) && isObject(detail.error)) {
+        // Preserve the error body even if it contains a host wrapper field.
+        return { __status: error.httpStatus, __body: detail };
+      }
     } catch (_) {}
-    return { error: { code: error.httpStatus, message: error.message, status: error.code } };
+    return { error: { code: error.httpStatus, message: error.message } };
   },
 };

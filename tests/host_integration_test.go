@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -84,6 +85,8 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 	var gatewayUpstream atomic.Bool
 	var providerStatus atomic.Int32
 	providerStatus.Store(http.StatusOK)
+	var expectedRequest atomic.Value
+	expectedRequest.Store(validBody)
 	var providerBody atomic.Value
 	providerBody.Store(`{` + answers + `,"usage":{"total_input_tokens":100,"total_output_tokens":0,"total_tokens":100}}`)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +105,7 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 		assert.Empty(t, r.URL.RawQuery, "client query strings must not carry credentials upstream")
 		body, readErr := io.ReadAll(r.Body)
 		require.NoError(t, readErr)
-		assert.JSONEq(t, validBody, string(body), "Google's native payload must retain its shape")
+		assert.JSONEq(t, expectedRequest.Load().(string), string(body), "Google's native payload must retain its shape")
 		var heldUser model.User
 		var heldToken model.Token
 		require.NoError(t, database.First(&heldUser, user.Id).Error)
@@ -156,6 +159,8 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 		return recorder
 	}
 	reset := func() {
+		expectedRequest.Store(validBody)
+		providerStatus.Store(http.StatusOK)
 		require.NoError(t, database.Model(&model.User{}).Where("id = ?", user.Id).Updates(map[string]any{"quota": initialQuota, "used_quota": 0}).Error)
 		require.NoError(t, database.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"remain_quota": initialQuota, "used_quota": 0}).Error)
 		require.NoError(t, database.Where("1 = 1").Delete(&model.Task{}).Error)
@@ -167,7 +172,7 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 			var gotUser model.User
 			var gotToken model.Token
 			return database.First(&gotUser, user.Id).Error == nil && database.First(&gotToken, token.Id).Error == nil &&
-				gotUser.Quota == initialQuota-want && gotToken.RemainQuota == initialQuota-want && gotToken.UsedQuota == want
+				gotUser.Quota == initialQuota-want && gotUser.UsedQuota == want && gotToken.RemainQuota == initialQuota-want && gotToken.UsedQuota == want
 		}, 3*time.Second, 10*time.Millisecond)
 	}
 	for _, tc := range []struct {
@@ -176,6 +181,8 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 	}{
 		{"native path", "/v1beta/decisions", `{"total_input_tokens":100,"total_output_tokens":0,"total_tokens":100}`, 100},
 		{"namespaced path", "/gemini-decisions/v1beta/decisions", `{"total_input_tokens":100,"total_output_tokens":0,"total_tokens":100}`, 100},
+		{"maximum trusted usage", "/v1beta/decisions", `{"total_input_tokens":262144}`, reservedQuota},
+		{"absent usage retains reserve", "/v1beta/decisions", "", reservedQuota},
 		{"explicit zero usage", "/v1beta/decisions", `{"total_input_tokens":0,"total_output_tokens":0,"total_tokens":0}`, 0},
 		{"missing usage retains reserve", "/v1beta/decisions", `{}`, reservedQuota},
 		{"negative usage retains reserve", "/v1beta/decisions", `{"total_input_tokens":-1}`, reservedQuota},
@@ -187,6 +194,9 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 			reset()
 			providerStatus.Store(http.StatusOK)
 			body := `{` + answers + `,"usage":` + tc.usage + `}`
+			if tc.usage == "" {
+				body = `{` + answers + `}`
+			}
 			providerBody.Store(body)
 			before := calls.Load()
 			response := request(tc.path, validBody, "Bearer fakegatewaytoken", "untrustedclientkey")
@@ -207,18 +217,41 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 			assert.Equal(t, tc.charge, logs[0].Quota)
 		})
 	}
-	t.Run("New API upstream uses namespaced route and Bearer", func(t *testing.T) {
+	for _, kind := range []string{"vendor", "new_api"} {
+		for _, suffix := range []string{"", "/", "/v1beta", "/v1beta/"} {
+			t.Run(kind+" base URL "+suffix, func(t *testing.T) {
+				reset()
+				gatewayUpstream.Store(kind == "new_api")
+				defer gatewayUpstream.Store(false)
+				channelType := constant.ChannelTypeTaskPlugin
+				if kind == "new_api" {
+					channelType = constant.ChannelTypeNewAPI
+				}
+				require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{"type": channelType, "base_url": upstream.URL + suffix}).Error)
+				defer database.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{"type": constant.ChannelTypeTaskPlugin, "base_url": upstream.URL})
+				body := `{` + answers + `,"usage":{"total_input_tokens":100}}`
+				providerBody.Store(body)
+				before := calls.Load()
+				response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.JSONEq(t, body, response.Body.String())
+				assert.Equal(t, before+1, calls.Load())
+				assertQuota(100)
+			})
+		}
+	}
+	t.Run("score and multimodal input preserve native payload", func(t *testing.T) {
 		reset()
-		gatewayUpstream.Store(true)
-		defer gatewayUpstream.Store(false)
-		require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("type", constant.ChannelTypeNewAPI).Error)
-		defer database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("type", constant.ChannelTypeTaskPlugin)
-		providerBody.Store(`{` + answers + `,"usage":{"total_input_tokens":100}}`)
+		body := `{"model":"gemini-decision-1","input":[{"type":"text","text":"Review"},{"type":"image","data":"YWJj","mime_type":"image/png"},{"type":"audio","uri":"https://media.example/voice.mp3","mime_type":"audio/mpeg"},{"type":"video","uri":"https://media.example/clip.mp4","mime_type":"video/mp4"},{"type":"document","data":"JVBERi0xLjQ=","mime_type":"application/pdf"}],"questions":{"rating":{"type":"score","instructions":[{"type":"text","text":"Rate clarity"}],"criteria":["Low","High"]},"check":{"type":"noul","instructions":{"type":"text","text":"Complete?"}},"pick":{"type":"choice","instructions":"Pick","criteria":{"A":"","B":""}}},"future_option":false}`
+		expectedRequest.Store(body)
+		result := `{"answers":{"rating":{"type":"score","score":1.25,"confidence":0.7},"check":{"type":"noul","noul":0.9},"pick":{"type":"choice","choice":"A"}},"usage":{"total_input_tokens":123}}`
+		providerBody.Store(result)
 		before := calls.Load()
-		response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
+		response := request("/v1beta/decisions", body, "Bearer fakegatewaytoken", "")
 		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.JSONEq(t, result, response.Body.String())
 		assert.Equal(t, before+1, calls.Load())
-		assertQuota(100)
+		assertQuota(123)
 	})
 	for _, tc := range []struct {
 		name, body, auth, key string
@@ -239,25 +272,136 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 			assertQuota(0)
 		})
 	}
-	t.Run("upstream failure refunds both balances", func(t *testing.T) {
+	questionBody := func(questions any) string {
+		body, marshalErr := json.Marshal(map[string]any{"model": "gemini-decision-1", "input": "sample", "questions": questions})
+		require.NoError(t, marshalErr)
+		return string(body)
+	}
+	validQuestion := map[string]any{"type": "noul", "instructions": "Yes?"}
+	tooManyQuestions := make(map[string]any, 1001)
+	for i := 0; i < 1001; i++ {
+		tooManyQuestions[fmt.Sprintf("q%d", i)] = validQuestion
+	}
+	tooManyChoices := make(map[string]string, 256)
+	for i := 0; i < 256; i++ {
+		tooManyChoices[fmt.Sprint(i)] = ""
+	}
+	t.Run("1000 valid questions are accepted", func(t *testing.T) {
 		reset()
-		providerStatus.Store(http.StatusBadRequest)
-		providerBody.Store(`{"error":{"code":400,"message":"fake upstream failure","status":"INVALID_ARGUMENT"}}`)
-		before := calls.Load()
-		response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
-		assert.GreaterOrEqual(t, response.Code, 400, response.Body.String())
-		assert.Equal(t, before+1, calls.Load())
-		assertQuota(0)
-		assert.NotContains(t, response.Body.String(), "fakegooglekey")
-		assert.NotContains(t, response.Body.String(), upstream.URL)
-	})
-	t.Run("invalid successful upstream response refunds both balances", func(t *testing.T) {
-		reset()
-		providerStatus.Store(http.StatusOK)
+		questions := make(map[string]any, 1000)
+		for i := 0; i < 1000; i++ {
+			questions[fmt.Sprintf("q%d", i)] = validQuestion
+		}
+		body := questionBody(questions)
+		expectedRequest.Store(body)
 		providerBody.Store(`{"answers":{},"usage":{"total_input_tokens":100}}`)
 		before := calls.Load()
+		response := request("/v1beta/decisions", body, "Bearer fakegatewaytoken", "")
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		assert.Equal(t, before+1, calls.Load())
+		assertQuota(100)
+	})
+	for _, tc := range []struct {
+		name      string
+		questions any
+	}{
+		{"missing questions", nil},
+		{"empty questions", map[string]any{}},
+		{"1001 questions", tooManyQuestions},
+		{"invalid question key", map[string]any{"bad.key": validQuestion}},
+		{"overlong question key", map[string]any{strings.Repeat("a", 65): validQuestion}},
+		{"null question", map[string]any{"q": nil}},
+		{"unsupported question type", map[string]any{"q": map[string]any{"type": "text", "instructions": "Yes?"}}},
+		{"missing instructions", map[string]any{"q": map[string]any{"type": "noul"}}},
+		{"invalid instructions", map[string]any{"q": map[string]any{"type": "noul", "instructions": 5}}},
+		{"invalid instruction block", map[string]any{"q": map[string]any{"type": "noul", "instructions": map[string]any{"type": "image", "data": "abc"}}}},
+		{"choice missing criteria", map[string]any{"q": map[string]any{"type": "choice", "instructions": "Choose"}}},
+		{"choice one criterion", map[string]any{"q": map[string]any{"type": "choice", "instructions": "Choose", "criteria": map[string]string{"A": ""}}}},
+		{"choice 256 criteria", map[string]any{"q": map[string]any{"type": "choice", "instructions": "Choose", "criteria": tooManyChoices}}},
+		{"score empty criterion", map[string]any{"q": map[string]any{"type": "score", "instructions": "Rate", "criteria": []string{"", "High"}}}},
+		{"score non-string criterion", map[string]any{"q": map[string]any{"type": "score", "instructions": "Rate", "criteria": []any{"Low", 2}}}},
+	} {
+		t.Run("invalid request rejects before billing/"+tc.name, func(t *testing.T) {
+			reset()
+			before := calls.Load()
+			response := request("/v1beta/decisions", questionBody(tc.questions), "Bearer fakegatewaytoken", "")
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Equal(t, before, calls.Load(), "invalid questions must not reach the provider")
+			assertQuota(0)
+			var taskCount, logCount int64
+			require.NoError(t, database.Model(&model.Task{}).Count(&taskCount).Error)
+			require.NoError(t, database.Model(&model.Log{}).Where("type = ?", model.LogTypeConsume).Count(&logCount).Error)
+			assert.Zero(t, taskCount)
+			assert.Zero(t, logCount)
+		})
+	}
+	for _, tc := range []struct {
+		name, body string
+		status     int
+	}{
+		{"empty answers", `{"answers":{},"usage":{"total_input_tokens":100}}`, http.StatusOK},
+		{"upstream fields resembling host wrappers", `{"__status":418,"__body":{"fake":"host wrapper"},"answers":{},"usage":{"total_input_tokens":100}}`, http.StatusOK},
+		{"null individual answer", `{"answers":{"pick":null},"usage":{"total_input_tokens":100}}`, http.StatusOK},
+		{"mismatched answer type", `{"answers":{"pick":{"type":"score","score":1.25}},"usage":{"total_input_tokens":100}}`, http.StatusOK},
+		{"missing answers", `{"usage":{"total_input_tokens":100}}`, http.StatusBadGateway},
+		{"null answers", `{"answers":null,"usage":{"total_input_tokens":100}}`, http.StatusBadGateway},
+		{"array answers", `{"answers":[],"usage":{"total_input_tokens":100}}`, http.StatusBadGateway},
+		{"scalar answers", `{"answers":"invalid","usage":{"total_input_tokens":100}}`, http.StatusBadGateway},
+	} {
+		t.Run("successful provider response remains billable/"+tc.name, func(t *testing.T) {
+			reset()
+			providerBody.Store(tc.body)
+			before := calls.Load()
+			response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			if tc.status == http.StatusOK {
+				assert.JSONEq(t, tc.body, response.Body.String())
+			}
+			assert.Equal(t, before+1, calls.Load())
+			assertQuota(100)
+			var task model.Task
+			require.NoError(t, database.First(&task).Error)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), task.Status)
+			assert.Equal(t, 100, task.Quota)
+			assert.True(t, task.PrivateData.ResultDiscarded)
+			assert.Empty(t, task.Data)
+			var logs []model.Log
+			require.NoError(t, database.Where("type = ?", model.LogTypeConsume).Find(&logs).Error)
+			require.Len(t, logs, 1)
+			assert.Equal(t, 100, logs[0].Quota)
+		})
+	}
+	for _, tc := range []struct{ name, body string }{
+		{"Decisions safety error", `{"error":{"code":"safety","message":"Request blocked due to safety violations (harmful content). Please modify your input and retry."}}`},
+		{"structured Google error", `{"error":{"code":400,"message":"Content blocked for safety reasons","status":"INVALID_ARGUMENT","details":[{"reason":"SAFETY"}]}}`},
+		{"error body resembling a host wrapper", `{"__status":200,"error":{"code":"safety","message":"Blocked"}}`},
+	} {
+		t.Run("Google 400 preserves JSON semantics and status/"+tc.name, func(t *testing.T) {
+			reset()
+			providerStatus.Store(http.StatusBadRequest)
+			providerBody.Store(tc.body)
+			before := calls.Load()
+			response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.JSONEq(t, tc.body, response.Body.String())
+			assert.Equal(t, before+1, calls.Load())
+			assertQuota(0)
+		})
+	}
+	t.Run("Google server error is sanitized by the host", func(t *testing.T) {
+		reset()
+		providerStatus.Store(http.StatusServiceUnavailable)
+		providerBody.Store(`{"error":{"code":503,"message":"private provider diagnostic fakegooglekey","status":"UNAVAILABLE"}}`)
+		before := calls.Load()
 		response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
-		assert.GreaterOrEqual(t, response.Code, 400, response.Body.String())
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+		assert.JSONEq(t, `{"error":{"code":503,"message":"Task request failed"}}`, response.Body.String())
+		assert.NotContains(t, response.Body.String(), "private provider diagnostic")
+		assert.NotContains(t, response.Body.String(), "fakegooglekey")
+		assert.NotContains(t, response.Body.String(), upstream.URL)
+		var envelope map[string]any
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &envelope))
+		assert.Contains(t, envelope, "error")
 		assert.Equal(t, before+1, calls.Load())
 		assertQuota(0)
 	})
