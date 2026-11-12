@@ -1,0 +1,47 @@
+{
+  "cases": [
+    {
+      "name": "decode a multimodal decision request",
+      "hook": "native",
+      "member": "decodeDecision",
+      "args": [{"body": {"kind": "json", "value": {"model": "gemini-decision-1", "input": [{"type": "text", "text": "Package"}, {"type": "image", "data": "YWJj", "mime_type": "image/png"}], "questions": {"damaged": {"type": "noul", "instructions": "Is it damaged?"}, "action": {"type": "choice", "instructions": "Choose", "criteria": {"replace": "Replace it", "refund": "Refund it"}}}, "future_option": false}}}],
+      "expected": {"kind": "submit", "model": "gemini-decision-1", "action": "decisions", "requestBody": {"model": "gemini-decision-1", "input": [{"type": "text", "text": "Package"}, {"type": "image", "data": "YWJj", "mime_type": "image/png"}], "questions": {"damaged": {"type": "noul", "instructions": "Is it damaged?"}, "action": {"type": "choice", "instructions": "Choose", "criteria": {"replace": "Replace it", "refund": "Refund it"}}}, "future_option": false}}
+    },
+    {"name": "reject a non-JSON request", "hook": "native", "member": "decodeDecision", "args": [{"body": {"kind": "form"}}], "expectedError": "JSON body required"},
+    {"name": "reject missing input", "hook": "native", "member": "decodeDecision", "args": [{"body": {"kind": "json", "value": {"model": "gemini-decision-1", "questions": {"q": {}}}}}], "expectedError": "input must be nonempty"},
+    {"name": "reject empty questions", "hook": "native", "member": "decodeDecision", "args": [{"body": {"kind": "json", "value": {"model": "gemini-decision-1", "input": "sample", "questions": {}}}}], "expectedError": "1 to 1000"},
+    {
+      "name": "send a mapped model and all input to Google",
+      "hook": "buildSubmitRequest",
+      "args": [{"baseUrl": "https://example.test/", "apiKey": "upstream-key", "model": "my-alias", "upstreamModel": "gemini-decision-1", "requestBody": {"model": "my-alias", "input": [{"type": "audio", "uri": "https://media.example/a.mp3", "mime_type": "audio/mpeg"}], "questions": {"q": {"type": "noul", "instructions": "Speech?"}}, "future_option": false}}],
+      "expected": {"url": "https://example.test/v1beta/decisions", "method": "POST", "headers": {"Content-Type": "application/json", "Accept": "application/json", "x-goog-api-key": "upstream-key"}, "body": {"model": "gemini-decision-1", "input": [{"type": "audio", "uri": "https://media.example/a.mp3", "mime_type": "audio/mpeg"}], "questions": {"q": {"type": "noul", "instructions": "Speech?"}}, "future_option": false}}
+    },
+    {
+      "name": "send a gateway token to another new-api",
+      "hook": "buildSubmitRequest",
+      "args": [{"baseUrl": "https://gateway.example", "apiKey": "gateway-token", "model": "gemini-decision-1", "upstream": {"kind": "new_api"}, "requestBody": {"model": "gemini-decision-1", "input": "sample", "questions": {"q": {"type": "noul", "instructions": "Yes?"}}}}],
+      "expected": {"url": "https://gateway.example/gemini-decisions/v1beta/decisions", "method": "POST", "headers": {"Content-Type": "application/json", "Accept": "application/json", "Authorization": "Bearer gateway-token"}, "body": {"model": "gemini-decision-1", "input": "sample", "questions": {"q": {"type": "noul", "instructions": "Yes?"}}}}
+    },
+    {"name": "reject an unsupported mapped model", "hook": "buildSubmitRequest", "args": [{"baseUrl": "https://example.test", "apiKey": "fake", "upstreamModel": "other-model", "requestBody": {"model": "alias", "input": "sample", "questions": {"q": {}}}}], "expectedError": "upstream model must be gemini-decision-1"},
+    {
+      "name": "complete synchronously with the Google envelope",
+      "hook": "parseSubmitResponse",
+      "args": [{"publicTaskId": "task-public", "requestBody": {"questions": {"q": {"type": "noul"}}}}, {"statusCode": 200, "body": {"answers": {"q": {"type": "noul", "noul": 0.91, "confidence": 0.91}}, "usage": {"total_input_tokens": 42, "total_output_tokens": 0}}}],
+      "expected": {"taskId": "task-public", "taskData": {"answers": {"q": {"type": "noul", "noul": 0.91, "confidence": 0.91}}, "usage": {"total_input_tokens": 42, "total_output_tokens": 0}}, "immediate": {"status": "SUCCESS", "progress": "100%"}}
+    },
+    {"name": "reject a missing answer", "hook": "parseSubmitResponse", "args": [{"publicTaskId": "task-public", "requestBody": {"questions": {"q": {"type": "noul"}}}}, {"statusCode": 200, "body": {"answers": {}}}], "expectedError": "missing a matching answer"},
+    {"name": "reserve the maximum input context", "hook": "extractUsage", "args": [{"model": "gemini-decision-1", "requestBody": {"model": "gemini-decision-1", "input": "sample", "questions": {"q": {"type": "noul"}}}}], "expected": {"input_tokens": 262144}},
+    {"name": "do not treat tokens as legacy billing ratios", "hook": "extractUsage", "args": [{"usagePurpose": "billing_ratios", "model": "gemini-decision-1", "requestBody": {"model": "gemini-decision-1", "input": "sample", "questions": {"q": {"type": "noul"}}}}], "expected": null},
+    {"name": "settle actual input tokens", "hook": "extractUsageOnComplete", "args": [{}, {}, {"usage": {"total_input_tokens": 42, "total_output_tokens": 0}}], "expected": {"input_tokens": 42}},
+    {"name": "preserve explicit zero usage", "hook": "extractUsageOnComplete", "args": [{}, {}, {"usage": {"total_input_tokens": 0}}], "expected": {"input_tokens": 0}},
+    {"name": "reject missing usage", "hook": "extractUsageOnComplete", "args": [{}, {}, {"usage": {}}], "expectedError": "usage is missing or outside"},
+    {"name": "reject negative usage", "hook": "extractUsageOnComplete", "args": [{}, {}, {"usage": {"total_input_tokens": -1}}], "expectedError": "usage is missing or outside"},
+    {"name": "reject fractional usage", "hook": "extractUsageOnComplete", "args": [{}, {}, {"usage": {"total_input_tokens": 1.5}}], "expectedError": "usage is missing or outside"},
+    {"name": "reject usage above the context limit", "hook": "extractUsageOnComplete", "args": [{}, {}, {"usage": {"total_input_tokens": 262145}}], "expectedError": "usage is missing or outside"},
+    {"name": "render the unmodified result", "hook": "native", "member": "renderDecision", "args": [{}, {"data": {"answers": {"q": {"type": "score", "score": 1.25, "confidence": 0.7}}, "usage": {"total_input_tokens": 10}}}], "expected": {"answers": {"q": {"type": "score", "score": 1.25, "confidence": 0.7}}, "usage": {"total_input_tokens": 10}}},
+    {"name": "render a Google safety error when the host supplies JSON details", "hook": "native", "member": "error", "args": [{}, {"httpStatus": 400, "code": "invalid_request", "message": "{\"error\":{\"code\":\"safety\",\"message\":\"Blocked\"}}"}], "expected": {"error": {"code": "safety", "message": "Blocked"}}},
+    {"name": "render a sanitized host error", "hook": "native", "member": "error", "args": [{}, {"httpStatus": 503, "code": "server_error", "message": "Task request failed"}], "expected": {"error": {"code": 503, "message": "Task request failed", "status": "server_error"}}},
+    {"name": "do not poll a synchronous response", "hook": "buildQueryRequest", "args": [], "expectedError": "no task retrieval endpoint"},
+    {"name": "unexpected polling stays unknown", "hook": "parseTaskResult", "args": [], "expected": {"status": "UNKNOWN", "reason": "Gemini Decisions has no asynchronous tasks"}}
+  ]
+}
