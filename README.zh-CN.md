@@ -8,7 +8,7 @@
 
 ## 环境与安装
 
-本项目以 new-api **v1.0.0-rc.49** 的 Task Plugin v1 接口为目标。该插件接口仍在演进；较旧版本可能不支持自定义原生路由或 `retainResult`。
+插件 **0.3.0** 支持官方 new-api **v1.0.0-rc.47** 和 **v1.0.0-rc.49** 的 Task Plugin v1 接口，并以真实宿主集成测试覆盖这两个版本。其他版本或定制 fork 的兼容性不作保证。
 
 1. 用 **Root 超级管理员**账号（上传和启用 Task Plugin 必需）打开 new-api 的 **Task Plugins / 任务插件** 页面，启用任务插件系统，上传仓库根目录的 `plugin.js` 并启用。也可以在上传对话框中使用 [plugin.js 的原始文件地址](https://raw.githubusercontent.com/huangdijia/new-api-plugin-gemini-decisions/main/plugin.js)。
 2. 创建 **Task Plugin** 类型渠道，选择 `gemini-decisions`：
@@ -17,7 +17,7 @@
    - 模型：`gemini-decision-1`，并配置允许调用的分组。
 3. 为模型配置下面的任务用量计费表达式，再使用 new-api 令牌调用。Google API key 只配置在渠道中，客户端使用 new-api 令牌。
 
-已有安装请上传并启用插件 **0.2.0**。new-api 不允许不同源码复用同一插件 key/version。现有计费表达式和固定 262,144-token 预扣保持不变。
+已有安装请上传并启用插件 **0.3.0**。new-api 不允许不同源码复用同一插件 key/version。现有计费表达式和固定 262,144-token 预扣保持不变。
 
 如果上游是另一台**也安装了本插件**的 new-api，可使用 New API 类型渠道并绑定该上游任务插件，渠道密钥填上游网关令牌。
 
@@ -55,9 +55,13 @@ curl "$NEW_API_BASE_URL/v1beta/decisions" \
   }'
 ```
 
-也可调用带插件前缀的 `/gemini-decisions/v1beta/decisions`。请求的 `input`、`questions` 和响应的 `answers`、`usage` 保留 Google 的 JSON 结构，模型映射仅修改发往上游的 `model`。
+插件在两个支持版本中均显式注册 `/v1beta/decisions` 和 `/gemini-decisions/v1beta/decisions`。请求的 `input`、`questions` 和响应的 `answers`、`usage` 保留 Google 的 JSON 结构，模型映射仅修改发往上游的 `model`。
 
 ## Google Python SDK
+
+SDK 默认会自动重试 5xx 响应。下例设置 `retry_options.attempts` 为 `1`，因为 rc.49 可能在结算用量后返回 502，自动重试可能导致重复收费。客户端重试前应核对网关日志和扣费记录；其他 502 也可能发生在结算之前。
+
+rc.47 可能在结算用量后，以 HTTP 200 返回缺少 `answers` 的响应。SDK 调用方读取结果前，必须检查 `answers` 是否缺失或为空、所需问题的答案是否缺失，以及 `usage` 是否缺失，不能仅凭 HTTP 成功判断；下例已加入这些检查。
 
 安装 `google-genai` 3.2.0 或更高版本。第三方插件路由需要 Bearer 网关令牌，因此还要显式设置 `Authorization`；SDK 默认发送的 `x-goog-api-key` 不能单独完成此插件的网关鉴权。
 
@@ -72,6 +76,7 @@ client = genai.Client(
         "base_url": os.environ["NEW_API_BASE_URL"],
         "api_version": "v1beta",
         "headers": {"Authorization": f"Bearer {token}"},
+        "retry_options": {"attempts": 1},
     },
 )
 
@@ -80,6 +85,10 @@ result = client.decisions.create(
     input="The mug arrived cracked.",
     questions={"damaged": {"type": "noul", "instructions": "Did the item arrive damaged?"}},
 )
+if not result.answers or result.answers.get("damaged") is None:
+    raise RuntimeError("Decision response is missing the damaged answer")
+if result.usage is None:
+    raise RuntimeError("Decision response is missing usage")
 print(result.answers["damaged"].noul, result.usage.total_input_tokens)
 ```
 
@@ -89,10 +98,11 @@ print(result.answers["damaged"].noul, result.usage.total_input_tokens)
 - `input` 支持 Google 的文本、多模态内容块、公开或签名的外部 HTTPS URL，以及已有的 Google Files URI。Google 的[输入限制](https://aistudio.google.com/docs/decisions-api#input)为：**每请求 inline data 最多 100 MB**、**PDF 最多 50 MB**、**每个外部 HTTPS URL 最多 15 MB**。较大文件请先直连 Google Files API 上传，再使用返回的 URI。本插件不实现 Files API 上传；任意外部 URL 不能绕过 15 MB 限制。
 - new-api **v1.0.0-rc.49** 的 `MAX_REQUEST_BODY_MB` 默认 **128 MiB**，限制的是完整解压后的 JSON 请求体。Base64 比原始文件约增大三分之一，还需加上 JSON 开销。例如，**100 MiB** 原始文件仅编码后就超过 128 MiB，尚未计入 JSON 开销。Google 的 100 MB inline 限制与宿主 128 MiB 请求体限制的单位和范围不同，不能笼统认定 100 MB 原始文件必然超过宿主限制。
 - 结果同步返回。new-api **v1.0.0-rc.49** 的 `RELAY_TIMEOUT` 默认 **0**，即不设置出站 HTTP 客户端的总超时；`RELAY_RESPONSE_HEADER_TIMEOUT` 默认 **1800 秒**，限制等待响应头的时间。客户端或反向代理的超时仍可能生效。
-- 对宿主成功读取并交给插件的上游 **2xx** 响应，答案缺项或答案 type 不符时仍按 usage 结算并保留上游答案；如果没有 `answers` 对象，则先结算用量再返回 **502**。用量异常时按上文保留预扣，不能仅凭 502 判断已退款。宿主将响应交给插件前发生的错误仍可能触发退款。
-- 多层 new-api 网关串联时，上游网关可能先结算用量，再因缺少 `answers` 对象返回 502；下游 v1.0.0-rc.49 网关遇到该非 2xx 响应会退还调用方费用，因此下游运营方可能承担上游费用。
+- 对宿主成功读取并交给插件的上游 **2xx** 响应，两个版本均以原生 JSON 返回正常的 `answers`、`usage`。答案缺项或答案 type 不符时仍按 usage 结算并保留上游答案。如果没有 `answers` 对象，则先结算用量。**rc.49 随后返回 HTTP 502**，响应体为 `{"error":{"code":502,"message":"Decision response is missing answers"}}`。**rc.47** 的宿主在此阶段无法修改状态，因此返回 **HTTP 200**，响应体必含同样的 `error` 对象；若上游 `usage` 为对象，还会将其原样复制到可选的 `usage` 字段。客户端必须检查 `answers` 是否存在，不能将 HTTP 200 直接视为成功。用量异常时按上文保留预扣，不能仅凭错误响应判断已退款。宿主将响应交给插件前发生的错误仍可能触发退款。
+- 多层 new-api 网关串联时，上游 rc.49 网关可能先结算用量，再因缺少 `answers` 对象返回 502；下游 rc.49 网关遇到该非 2xx 响应会退还调用方费用，因此下游运营方可能承担上游费用。上游 rc.47 网关则返回 HTTP 200 和上述错误响应体，其中可选的 `usage` 可供运行本插件的下游网关按合法的 `usage.total_input_tokens` 结算；用量缺失或不合法时，下游网关保留预扣。
 - 插件设置 `retainResult: false`：new-api 不持久化该调用的 `task.data`，但仍保留任务和计费日志，具体日志内容由宿主配置决定。
-- HTTP 错误由 new-api 宿主处理。部分上游 4xx JSON 错误结构可保留，但不保证逐字节原样透传，5xx 细节可能被净化。插件不记录密钥或请求内容。
+- HTTP 错误由 new-api 宿主处理。两个版本的上游 400 和 5xx 错误通过 `native.error` 返回时，均保留宿主选择的 HTTP 状态。部分上游 4xx JSON 错误结构可保留，但不保证逐字节原样透传，5xx 细节可能被净化。插件不记录密钥或请求内容。
+- 插件仅将 `ctx.requestHeaders` 是否存在用作区分这两个官方版本的宿主能力特征，不保证定制 fork 的兼容性。
 
 ## 验证
 
@@ -103,15 +113,23 @@ new-api plugin lint plugin.js
 new-api plugin test plugin.js --fixture fixtures/decisions.json
 ```
 
-宿主集成测试使用本机模拟 Google、SQLite 和真实的 new-api 路由及计费流程，不需要真实密钥。请使用独立的 `v1.0.0-rc.49` 源码检出运行：
+宿主集成测试使用本机模拟 Google、SQLite 和真实的 new-api 路由及计费流程，不需要真实密钥。请提供对应官方版本的源码目录及 Python 3。脚本使用 Go overlay，不修改宿主源码检出；Python 3 用于生成 overlay：
 
 ```bash
-tests/run-integration.sh /path/to/new-api-v1.0.0-rc.49
+tests/run-integration.sh /path/to/new-api-v1.0.0-rc.47 rc.47
+tests/run-integration.sh /path/to/new-api-v1.0.0-rc.49 rc.49
 ```
 
-安装 `google-genai` 3.2.0 后，还可以运行 `python tests/sdk_compat_test.py`，通过本机模拟服务检查 SDK 的路径、Bearer 请求头及响应解析。此测试独立于宿主集成测试。
+第二个参数指定预期的宿主行为，省略时默认为 `rc.49`。安装 `google-genai==3.2.0` 后，将 `GEMINI_DECISIONS_SDK_PYTHON` 设为该 Python 解释器路径，即可在集成测试中通过真实宿主执行 SDK 请求：
 
-[GitHub Actions 工作流](.github/workflows/test.yml)使用固定版本的 new-api 执行这些检查。以上检查使用 fixture 或本机模拟服务，不代表已成功调用真实 Google API。
+```bash
+GEMINI_DECISIONS_SDK_PYTHON=/path/to/venv/bin/python \
+  tests/run-integration.sh /path/to/new-api-v1.0.0-rc.47 rc.47
+```
+
+也可独立运行 `python tests/sdk_compat_test.py`，通过本机模拟服务检查 SDK 的路径、Bearer 请求头及响应解析。
+
+[GitHub Actions 工作流](.github/workflows/test.yml)使用两个官方版本的固定 revision，覆盖 lint、fixtures、真实宿主集成及 Google Python SDK 3.2.0 测试。以上检查使用 fixture 或本机模拟上游，不代表已成功调用真实 Google API。
 
 ## 许可
 

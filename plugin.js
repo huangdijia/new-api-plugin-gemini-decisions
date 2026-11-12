@@ -10,7 +10,7 @@ export const meta = {
   apiVersion: 1,
   key: PLUGIN_KEY,
   name: "Gemini Decisions",
-  version: "0.2.0",
+  version: "0.3.0",
   icon: "Gemini.Color",
   author: { name: "huangdijia", url: "https://github.com/huangdijia" },
   website: "https://github.com/huangdijia/new-api-plugin-gemini-decisions",
@@ -32,6 +32,14 @@ export const meta = {
       render: "renderDecision",
       retainResult: false,
     },
+    {
+      method: "POST",
+      path: "/gemini-decisions/v1beta/decisions",
+      type: "submit",
+      decode: "decodeDecision",
+      render: "renderDecision",
+      retainResult: false,
+    },
   ],
   usageSchema: {
     input_tokens: {
@@ -45,6 +53,13 @@ export const meta = {
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function nativeReply(ctx, status, body) {
+  // Official rc.49 added requestHeaders and native reply wrappers together;
+  // rc.47 exposes neither. Forks with only one backport need verification.
+  if (isObject(ctx.requestHeaders)) return { __status: status, __body: body };
+  return body;
 }
 
 function isTextBlock(value) {
@@ -165,11 +180,14 @@ export const native = {
     // Native presenters run after the host settles billing. Individual answers
     // remain untouched, even if incomplete or a future type is returned.
     if (!isObject(task.data) || !isObject(task.data.answers)) {
-      return { __status: 502, __body: { error: { code: 502, message: "Decision response is missing answers" } } };
+      const body = { error: { code: 502, message: "Decision response is missing answers" } };
+      // rc.47 must return HTTP 200 here. Forward usage so a chained gateway
+      // can settle the actual charge instead of retaining its reservation.
+      if (!isObject(ctx.requestHeaders) && isObject(task.data) && isObject(task.data.usage)) body.usage = task.data.usage;
+      return nativeReply(ctx, 502, body);
     }
-    // Wrapping also keeps an upstream __status field from being interpreted as
-    // a host reply wrapper instead of part of the Google response.
-    return { __status: 200, __body: task.data };
+    // On newer hosts the wrapper also preserves any upstream __status field.
+    return nativeReply(ctx, 200, task.data);
   },
   error: function (ctx, error) {
     // The host supplies a sanitized error, not the original HTTP response.
@@ -178,7 +196,7 @@ export const native = {
       const detail = JSON.parse(error.message);
       if (isObject(detail) && isObject(detail.error)) {
         // Preserve the error body even if it contains a host wrapper field.
-        return { __status: error.httpStatus, __body: detail };
+        return nativeReply(ctx, error.httpStatus, detail);
       }
     } catch (_) {}
     return { error: { code: error.httpStatus, message: error.message } };

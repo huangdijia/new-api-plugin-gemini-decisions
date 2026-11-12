@@ -11,9 +11,17 @@ permissions:
 
 jobs:
   host:
-    name: new-api v1.0.0-rc.49
+    name: new-api v1.0.0-${{ matrix.host.version }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        host:
+          - version: rc.47
+            ref: e835b1bfc43b565d625537830dbfb19328925134
+          - version: rc.49
+            ref: 48a6c87f9e7757fdc58e5be9bcb4f8281ad0dfd0
     steps:
       - name: Check out plugin
         uses: actions/checkout@v4
@@ -24,8 +32,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: QuantumNous/new-api
-          # v1.0.0-rc.49; use an immutable revision instead of a moving tag.
-          ref: 48a6c87f9e7757fdc58e5be9bcb4f8281ad0dfd0
+          # Each host version is pinned to an immutable revision.
+          ref: ${{ matrix.host.ref }}
           path: new-api
           persist-credentials: false
       - name: Set up host Go version
@@ -36,6 +44,12 @@ jobs:
             new-api/go.sum
             new-api/relaykit/go.sum
             new-api/tokenkit/go.sum
+      - name: Set up Python for SDK integration
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install official SDK
+        run: python -m pip install google-genai==3.2.0
       - name: Run real host plugin lint and fixture
         working-directory: new-api
         shell: bash
@@ -62,7 +76,9 @@ jobs:
             --fixture "$GITHUB_WORKSPACE/plugin/fixtures/decisions.json"
       - name: Run real host integration with local upstream mock
         shell: bash
-        run: bash plugin/tests/run-integration.sh "$GITHUB_WORKSPACE/new-api"
+        env:
+          GEMINI_DECISIONS_SDK_PYTHON: python
+        run: bash plugin/tests/run-integration.sh "$GITHUB_WORKSPACE/new-api" "${{ matrix.host.version }}"
 
   sdk:
     name: Google Python SDK 3.2.0 local contract

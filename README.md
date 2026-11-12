@@ -8,7 +8,7 @@ The plugin is a standalone `gemini-decisions` plugin and does not replace new-ap
 
 ## Requirements and Installation
 
-This project targets the Task Plugin v1 interface in new-api **v1.0.0-rc.49**. The plugin interface is still evolving; older versions may not support custom native routes or `retainResult`.
+Plugin **0.3.0** supports the Task Plugin v1 interface in official new-api **v1.0.0-rc.47** and **v1.0.0-rc.49**. Real host integration tests cover both releases. Compatibility with other releases or customized forks is not guaranteed.
 
 1. Sign in to new-api as a **Root super administrator** (required to upload and enable Task Plugins), open **Task Plugins**, enable the task plugin system, then upload and enable `plugin.js` from the repository root. You can also use the [raw URL for plugin.js](https://raw.githubusercontent.com/huangdijia/new-api-plugin-gemini-decisions/main/plugin.js) in the upload dialog.
 2. Create a channel of type **Task Plugin** and select `gemini-decisions`:
@@ -17,7 +17,7 @@ This project targets the Task Plugin v1 interface in new-api **v1.0.0-rc.49**. T
    - Model: `gemini-decision-1`. Configure the groups allowed to use it.
 3. Configure the task usage billing expression below for the model, then make requests with a new-api token. Configure the Google API key only in the channel; clients use a new-api token.
 
-For an existing installation, upload and enable plugin **0.2.0**. new-api does not allow different source code to reuse the same plugin key/version. Existing billing expressions and the fixed 262,144-token reservation remain unchanged.
+For an existing installation, upload and enable plugin **0.3.0**. new-api does not allow different source code to reuse the same plugin key/version. Existing billing expressions and the fixed 262,144-token reservation remain unchanged.
 
 If the upstream is another new-api instance **with this plugin installed**, you can use a channel of type New API, bind it to the upstream task plugin, and set the channel key to the upstream gateway token.
 
@@ -55,9 +55,13 @@ curl "$NEW_API_BASE_URL/v1beta/decisions" \
   }'
 ```
 
-You can also use the plugin-prefixed route `/gemini-decisions/v1beta/decisions`. The request's `input` and `questions` and the response's `answers` and `usage` retain Google's JSON structure. Model mapping only changes the `model` sent upstream.
+The plugin explicitly registers both `/v1beta/decisions` and `/gemini-decisions/v1beta/decisions` on both supported releases. The request's `input` and `questions` and the response's `answers` and `usage` retain Google's JSON structure. Model mapping only changes the `model` sent upstream.
 
 ## Google Python SDK
+
+The SDK retries 5xx responses automatically by default. The example sets `retry_options.attempts` to `1` because rc.49 can return 502 after usage has already been settled; retrying that request may charge it again. Check gateway logs and charges before retrying. Other 502 responses may occur before settlement.
+
+On rc.47, a missing `answers` object can arrive with HTTP 200 after usage has been settled. SDK callers must check for missing or empty `answers`, a missing requested answer, and missing `usage` before reading them; do not rely on HTTP success alone. The example below includes these checks.
 
 Install `google-genai` 3.2.0 or later. Third-party plugin routes require a Bearer gateway token, so you must also explicitly set `Authorization`. The `x-goog-api-key` header sent by the SDK by default is not sufficient on its own for gateway authentication with this plugin.
 
@@ -72,6 +76,7 @@ client = genai.Client(
         "base_url": os.environ["NEW_API_BASE_URL"],
         "api_version": "v1beta",
         "headers": {"Authorization": f"Bearer {token}"},
+        "retry_options": {"attempts": 1},
     },
 )
 
@@ -80,6 +85,10 @@ result = client.decisions.create(
     input="The mug arrived cracked.",
     questions={"damaged": {"type": "noul", "instructions": "Did the item arrive damaged?"}},
 )
+if not result.answers or result.answers.get("damaged") is None:
+    raise RuntimeError("Decision response is missing the damaged answer")
+if result.usage is None:
+    raise RuntimeError("Decision response is missing usage")
 print(result.answers["damaged"].noul, result.usage.total_input_tokens)
 ```
 
@@ -89,10 +98,11 @@ print(result.answers["damaged"].noul, result.usage.total_input_tokens)
 - `input` supports Google's text, multimodal content blocks, public or signed external HTTPS URLs, and existing Google Files URIs. Google's [input limits](https://aistudio.google.com/docs/decisions-api#input) allow up to **100 MB of inline data per request**, **50 MB for PDF**, and **15 MB per external HTTPS URL**. For larger files, upload directly to the Google Files API first and use the resulting URI. This plugin does not implement Files API uploads; an arbitrary external URL does not bypass the 15 MB limit.
 - In new-api **v1.0.0-rc.49**, `MAX_REQUEST_BODY_MB` defaults to **128 MiB** and limits the entire decompressed JSON request body. Base64 adds approximately one third to the raw file size, plus JSON overhead. For example, a **100 MiB** raw file exceeds 128 MiB after Base64 encoding, even before JSON overhead. Google's 100 MB inline limit and the host's 128 MiB body limit use different units and scopes; a 100 MB raw file does not necessarily exceed the host limit.
 - Results are synchronous. In new-api **v1.0.0-rc.49**, `RELAY_TIMEOUT` defaults to **0**, which sets no overall timeout on the outbound HTTP client. `RELAY_RESPONSE_HEADER_TIMEOUT` defaults to **1800 seconds** and limits the wait for response headers. Client or reverse-proxy timeouts may still apply.
-- For upstream **2xx** responses successfully read by the host and passed to the plugin, missing answer entries or mismatched answer types do not prevent usage settlement; the plugin preserves the upstream answers. If there is no `answers` object, it settles usage first and then returns **502**. Invalid usage retains the reservation as described above; a 502 alone does not imply a refund. Failures before the host passes the response to the plugin may still cause a refund.
-- When new-api gateways are chained, an upstream gateway may settle usage and then return 502 for a missing `answers` object. A downstream v1.0.0-rc.49 gateway refunds its caller on that non-2xx response, so the downstream operator may bear the upstream charge.
+- For upstream **2xx** responses successfully read by the host and passed to the plugin, both releases return normal `answers` and `usage` as native JSON. Missing answer entries or mismatched answer types do not prevent usage settlement; the plugin preserves the upstream answers. If there is no `answers` object, it settles usage first. On **rc.49**, it then returns **HTTP 502** with `{"error":{"code":502,"message":"Decision response is missing answers"}}`. On **rc.47**, the host cannot change the status at this stage, so it returns **HTTP 200** with the same required `error` object and, if the upstream `usage` is an object, that object copied unchanged as an optional `usage` field. Clients must detect the missing `answers` rather than treating HTTP 200 as success. Invalid usage retains the reservation as described above; an error response alone does not imply a refund. Failures before the host passes the response to the plugin may still cause a refund.
+- When new-api gateways are chained, an upstream rc.49 gateway may settle usage and then return 502 for a missing `answers` object. A downstream rc.49 gateway refunds its caller on that non-2xx response, so the downstream operator may bear the upstream charge. An upstream rc.47 gateway instead returns HTTP 200 with the error body described above. Its optional `usage` lets a downstream gateway running this plugin settle using a valid `usage.total_input_tokens`; if usage is missing or invalid, that downstream gateway retains the reservation.
 - The plugin sets `retainResult: false`: new-api does not persist `task.data` for the call, but still retains task records and billing logs. The exact log contents depend on the host configuration.
-- HTTP errors are processed by the new-api host. Some upstream 4xx JSON error envelopes can be preserved, but byte-for-byte passthrough is not guaranteed, and 5xx details may be sanitized. The plugin does not log keys or request contents.
+- HTTP errors are processed by the new-api host. On both releases, upstream 400 and 5xx errors retain the host-selected HTTP status through `native.error`. Some upstream 4xx JSON error envelopes can be preserved, but byte-for-byte passthrough is not guaranteed, and 5xx details may be sanitized. The plugin does not log keys or request contents.
+- The plugin uses the presence of `ctx.requestHeaders` only as a host capability feature distinguishing these two official releases. This does not guarantee compatibility with customized forks.
 
 ## Verification
 
@@ -103,15 +113,23 @@ new-api plugin lint plugin.js
 new-api plugin test plugin.js --fixture fixtures/decisions.json
 ```
 
-The host integration tests use a local mock Google service, SQLite, and the real new-api routing and billing flow. No real key is required. Run them against a separate source checkout of `v1.0.0-rc.49`:
+The host integration tests use a local mock Google service, SQLite, and the real new-api routing and billing flow. No real key is required. Provide the official source directory for the corresponding release and Python 3. The script uses a Go overlay and does not modify the host source checkout; Python 3 generates the overlay:
 
 ```bash
-tests/run-integration.sh /path/to/new-api-v1.0.0-rc.49
+tests/run-integration.sh /path/to/new-api-v1.0.0-rc.47 rc.47
+tests/run-integration.sh /path/to/new-api-v1.0.0-rc.49 rc.49
 ```
 
-After installing `google-genai` 3.2.0, you can also run `python tests/sdk_compat_test.py` to check the SDK's request path, Bearer header, and response parsing against a local mock service. This test is independent of the host integration tests.
+The second argument selects the expected host behavior and defaults to `rc.49` when omitted. After installing `google-genai==3.2.0`, set `GEMINI_DECISIONS_SDK_PYTHON` to that Python interpreter to run SDK requests through the real host as part of integration testing:
 
-The [GitHub Actions workflow](.github/workflows/test.yml) runs these checks against a pinned new-api revision. These checks use fixtures or local mocks; they do not demonstrate a successful request to the live Google API.
+```bash
+GEMINI_DECISIONS_SDK_PYTHON=/path/to/venv/bin/python \
+  tests/run-integration.sh /path/to/new-api-v1.0.0-rc.47 rc.47
+```
+
+You can also run `python tests/sdk_compat_test.py` independently to check the SDK's request path, Bearer header, and response parsing against a local mock service.
+
+The [GitHub Actions workflow](.github/workflows/test.yml) runs lint, fixtures, real host integration, and Google Python SDK 3.2.0 checks for both releases at pinned official revisions. These checks use fixtures or local upstream mocks; they do not demonstrate a successful request to the live Google API.
 
 ## License
 

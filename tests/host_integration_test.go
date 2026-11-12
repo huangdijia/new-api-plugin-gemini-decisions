@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file is injected into an isolated host checkout by run-integration.sh.
+// This file is overlaid onto a host checkout by run-integration.sh.
 // It deliberately uses production handlers and accounting, without mocked JS
 // hooks or a fake BillingSettler. All credentials and provider data are fake.
 func TestGeminiDecisionsIntegration(t *testing.T) {
@@ -34,6 +36,11 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 	const reservedQuota = 262_144 // The fixture's $2 / million token price gives one quota per token.
 	const validBody = `{"model":"gemini-decision-1","input":"Choose a plan","questions":{"pick":{"type":"choice","instructions":"Pick one","criteria":{"A":"First","B":"Second"}}}}`
 	const answers = `"answers":{"pick":{"type":"choice","choice":"A","probabilities":{"A":0.8,"B":0.2},"confidence":0.8}}`
+	hostVersion := os.Getenv("GEMINI_DECISIONS_HOST_VERSION")
+	if hostVersion == "" {
+		hostVersion = "rc.49"
+	}
+	require.Contains(t, []string{"rc.47", "rc.49"}, hostVersion)
 	gin.SetMode(gin.TestMode)
 	require.NoError(t, i18n.Init())
 	source, err := os.ReadFile(os.Getenv("GEMINI_DECISIONS_PLUGIN_SOURCE"))
@@ -217,6 +224,49 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 			assert.Equal(t, tc.charge, logs[0].Quota)
 		})
 	}
+	t.Run("double plugin prefix is not registered", func(t *testing.T) {
+		reset()
+		before := calls.Load()
+		response := request("/gemini-decisions/gemini-decisions/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
+		assert.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+		assert.Equal(t, before, calls.Load())
+		assertQuota(0)
+	})
+	if python := os.Getenv("GEMINI_DECISIONS_SDK_PYTHON"); python != "" {
+		for _, tc := range []struct{ name, prefix string }{
+			{"native path", ""},
+			{"namespaced path", "/gemini-decisions"},
+		} {
+			t.Run("Google SDK against host/"+tc.name, func(t *testing.T) {
+				reset()
+				providerBody.Store(`{` + answers + `,"usage":{"total_input_tokens":100,"total_output_tokens":0,"total_tokens":100}}`)
+				server := httptest.NewServer(engine)
+				defer server.Close()
+				before := calls.Load()
+				script := filepath.Join(filepath.Dir(os.Getenv("GEMINI_DECISIONS_PLUGIN_SOURCE")), "tests", "sdk_host_smoke.py")
+				cmd := exec.Command(python, script, server.URL+tc.prefix)
+				output, runErr := cmd.CombinedOutput()
+				require.NoError(t, runErr, "%s", output)
+				assert.Equal(t, before+1, calls.Load())
+				assertQuota(100)
+			})
+		}
+		t.Run("Google SDK against host/missing answers", func(t *testing.T) {
+			reset()
+			providerBody.Store(`{"usage":{"total_input_tokens":100}}`)
+			server := httptest.NewServer(engine)
+			defer server.Close()
+			before := calls.Load()
+			script := filepath.Join(filepath.Dir(os.Getenv("GEMINI_DECISIONS_PLUGIN_SOURCE")), "tests", "sdk_host_smoke.py")
+			cmd := exec.Command(python, script, server.URL, "missing-answers", hostVersion)
+			output, runErr := cmd.CombinedOutput()
+			require.NoError(t, runErr, "%s", output)
+			assert.Equal(t, before+1, calls.Load())
+			assertQuota(100)
+		})
+	} else {
+		t.Log("Google SDK against host skipped: GEMINI_DECISIONS_SDK_PYTHON is not set")
+	}
 	for _, kind := range []string{"vendor", "new_api"} {
 		for _, suffix := range []string{"", "/", "/v1beta", "/v1beta/"} {
 			t.Run(kind+" base URL "+suffix, func(t *testing.T) {
@@ -341,6 +391,8 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 	}{
 		{"empty answers", `{"answers":{},"usage":{"total_input_tokens":100}}`, http.StatusOK},
 		{"upstream fields resembling host wrappers", `{"__status":418,"__body":{"fake":"host wrapper"},"answers":{},"usage":{"total_input_tokens":100}}`, http.StatusOK},
+		{"upstream status is a string", `{"__status":"not a status","answers":{},"usage":{"total_input_tokens":100}}`, http.StatusOK},
+		{"upstream status is out of range", `{"__status":999,"answers":{},"usage":{"total_input_tokens":100}}`, http.StatusOK},
 		{"null individual answer", `{"answers":{"pick":null},"usage":{"total_input_tokens":100}}`, http.StatusOK},
 		{"mismatched answer type", `{"answers":{"pick":{"type":"score","score":1.25}},"usage":{"total_input_tokens":100}}`, http.StatusOK},
 		{"missing answers", `{"usage":{"total_input_tokens":100}}`, http.StatusBadGateway},
@@ -353,9 +405,17 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 			providerBody.Store(tc.body)
 			before := calls.Load()
 			response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
-			require.Equal(t, tc.status, response.Code, response.Body.String())
+			wantStatus := tc.status
+			if hostVersion == "rc.47" && tc.status == http.StatusBadGateway {
+				wantStatus = http.StatusOK // rc.47 cannot change the status after settlement.
+			}
+			require.Equal(t, wantStatus, response.Code, response.Body.String())
 			if tc.status == http.StatusOK {
 				assert.JSONEq(t, tc.body, response.Body.String())
+			} else if hostVersion == "rc.47" {
+				assert.JSONEq(t, `{"error":{"code":502,"message":"Decision response is missing answers"},"usage":{"total_input_tokens":100}}`, response.Body.String())
+			} else {
+				assert.JSONEq(t, `{"error":{"code":502,"message":"Decision response is missing answers"}}`, response.Body.String())
 			}
 			assert.Equal(t, before+1, calls.Load())
 			assertQuota(100)
@@ -371,6 +431,54 @@ func TestGeminiDecisionsIntegration(t *testing.T) {
 			assert.Equal(t, 100, logs[0].Quota)
 		})
 	}
+	for _, tc := range []struct{ name, body string }{
+		{"missing usage", `{}`},
+		{"invalid usage", `{"usage":{"total_input_tokens":-1}}`},
+	} {
+		t.Run("missing answers with "+tc.name+" retains reservation", func(t *testing.T) {
+			reset()
+			providerBody.Store(tc.body)
+			before := calls.Load()
+			response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
+			wantStatus := http.StatusBadGateway
+			if hostVersion == "rc.47" {
+				wantStatus = http.StatusOK
+			}
+			assert.Equal(t, wantStatus, response.Code, response.Body.String())
+			var envelope map[string]any
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &envelope))
+			assert.Contains(t, envelope, "error")
+			if hostVersion == "rc.47" && tc.name == "invalid usage" {
+				assert.Equal(t, map[string]any{"total_input_tokens": float64(-1)}, envelope["usage"])
+			} else {
+				assert.NotContains(t, envelope, "usage")
+			}
+			assert.Equal(t, before+1, calls.Load())
+			assertQuota(reservedQuota)
+		})
+	}
+	t.Run("legacy gateway error carries usage through chained gateway", func(t *testing.T) {
+		reset()
+		gatewayUpstream.Store(true)
+		defer gatewayUpstream.Store(false)
+		require.NoError(t, database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("type", constant.ChannelTypeNewAPI).Error)
+		defer database.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("type", constant.ChannelTypeTaskPlugin)
+		providerBody.Store(`{"error":{"code":502,"message":"Decision response is missing answers"},"usage":{"total_input_tokens":100}}`)
+		before := calls.Load()
+		response := request("/v1beta/decisions", validBody, "Bearer fakegatewaytoken", "")
+		wantStatus := http.StatusBadGateway
+		if hostVersion == "rc.47" {
+			wantStatus = http.StatusOK
+		}
+		assert.Equal(t, wantStatus, response.Code, response.Body.String())
+		if hostVersion == "rc.47" {
+			assert.JSONEq(t, `{"error":{"code":502,"message":"Decision response is missing answers"},"usage":{"total_input_tokens":100}}`, response.Body.String())
+		} else {
+			assert.JSONEq(t, `{"error":{"code":502,"message":"Decision response is missing answers"}}`, response.Body.String())
+		}
+		assert.Equal(t, before+1, calls.Load())
+		assertQuota(100)
+	})
 	for _, tc := range []struct{ name, body string }{
 		{"Decisions safety error", `{"error":{"code":"safety","message":"Request blocked due to safety violations (harmful content). Please modify your input and retry."}}`},
 		{"structured Google error", `{"error":{"code":400,"message":"Content blocked for safety reasons","status":"INVALID_ARGUMENT","details":[{"reason":"SAFETY"}]}}`},
